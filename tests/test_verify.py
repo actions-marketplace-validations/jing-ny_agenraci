@@ -257,6 +257,50 @@ def test_cli_verify_both_modes_exit_two(tmp_path):
     assert "exactly one" in result.stdout
 
 
+def test_cli_verify_limit_without_org_exit_two(tmp_path):
+    """--limit only makes sense with --org; using it elsewhere is a usage error."""
+    charter = _charter(tmp_path, _HUMAN_GATED)
+    settings = _settings(tmp_path, code_owners=["alice"], required_reviews=1)
+    result = runner.invoke(app, ["verify", str(charter), "--settings", str(settings),
+                                 "--limit", "5"])
+    assert result.exit_code == 2
+    assert "--limit only applies to --org" in result.stdout
+
+
+def test_cli_verify_org_threads_limit_into_sweep(tmp_path, monkeypatch):
+    """The CLI passes --limit straight through to sweep_org (no network needed)."""
+    from agenraci.adapters.github import OrgSweepReport
+
+    charter = _charter(tmp_path, _HUMAN_GATED)
+    captured = {}
+
+    def fake_sweep_org(charter_arg, org, *, branch="main", limit=1000):
+        captured.update(org=org, branch=branch, limit=limit)
+        return OrgSweepReport(org=org, branch=branch, results=[], ok=True)
+
+    monkeypatch.setattr("agenraci.cli.sweep_org", fake_sweep_org)
+    result = runner.invoke(app, ["verify", str(charter), "--org", "acme", "--limit", "42"])
+    assert result.exit_code == 0
+    assert captured == {"org": "acme", "branch": "main", "limit": 42}
+
+
+def test_cli_verify_org_defaults_limit_to_1000(tmp_path, monkeypatch):
+    """Omitting --limit sweeps with the documented default cap of 1000."""
+    from agenraci.adapters.github import OrgSweepReport
+
+    charter = _charter(tmp_path, _HUMAN_GATED)
+    captured = {}
+
+    def fake_sweep_org(charter_arg, org, *, branch="main", limit=1000):
+        captured["limit"] = limit
+        return OrgSweepReport(org=org, branch=branch, results=[], ok=True)
+
+    monkeypatch.setattr("agenraci.cli.sweep_org", fake_sweep_org)
+    result = runner.invoke(app, ["verify", str(charter), "--org", "acme"])
+    assert result.exit_code == 0
+    assert captured["limit"] == 1000
+
+
 def test_cli_verify_human_format_clean_and_drift(tmp_path):
     """The default human output renders OK / DRIFT verdicts with correct exits."""
     charter = _charter(tmp_path, _HUMAN_GATED)
@@ -554,7 +598,7 @@ def test_cli_verify_org_json(tmp_path, monkeypatch):
             project="t", branch="main", ok=True, findings=[], unenforceable=[])),
         RepoResult("o/b", "could-not-check", error="HTTP 403: Forbidden"),
     ])
-    monkeypatch.setattr("agenraci.cli.sweep_org", lambda c, o, branch="main": fake)
+    monkeypatch.setattr("agenraci.cli.sweep_org", lambda c, o, branch="main", limit=1000: fake)
     result = runner.invoke(app, ["verify", str(charter), "--org", "o",
                                  "--format", "json"])
     assert result.exit_code == 1  # not ok
@@ -586,7 +630,7 @@ def test_cli_verify_org_human_format(tmp_path, monkeypatch):
             findings=[VerifyFinding("main", "drift", "no review required")],
             unenforceable=[])),
     ])
-    monkeypatch.setattr("agenraci.cli.sweep_org", lambda c, o, branch="main": fake)
+    monkeypatch.setattr("agenraci.cli.sweep_org", lambda c, o, branch="main", limit=1000: fake)
     result = runner.invoke(app, ["verify", str(charter), "--org", "o"])
     assert result.exit_code == 1
     assert "o/a" in result.stdout and "o/b" in result.stdout
@@ -613,9 +657,85 @@ def test_cli_verify_org_empty_says_nothing_to_verify(tmp_path, monkeypatch):
     charter = _charter(tmp_path, _HUMAN_GATED)
     monkeypatch.setattr(
         "agenraci.cli.sweep_org",
-        lambda c, o, branch="main": OrgSweepReport(
+        lambda c, o, branch="main", limit=1000: OrgSweepReport(
             org="empty", branch="main", ok=True, results=[]),
     )
     result = runner.invoke(app, ["verify", str(charter), "--org", "empty"])
     assert result.exit_code == 0
     assert "0 repos found" in result.stdout
+
+
+def test_cli_verify_sarif_drift(tmp_path):
+    """`verify --format sarif` emits one SARIF doc: drift=error results, exit 1 (#72)."""
+    charter = _charter(tmp_path, _HUMAN_GATED)
+    settings = _settings(tmp_path, branch="main", required_reviews=0,
+                         require_code_owner_review=False, code_owners=[])
+    result = runner.invoke(app, ["verify", str(charter), "--settings", str(settings),
+                                 "--format", "sarif"])
+    assert result.exit_code == 1
+    doc = json.loads(result.stdout)
+    assert doc["version"] == "2.1.0"
+    assert doc["$schema"].startswith("https://raw.githubusercontent.com/oasis-tcs/sarif-spec/")
+    run = doc["runs"][0]
+    assert run["tool"]["driver"]["name"] == "AgenRACI"
+    assert {r["id"] for r in run["tool"]["driver"]["rules"]} == {"drift", "unenforceable"}
+    assert len(run["results"]) >= 1
+    assert all(r["ruleId"] == "drift" and r["level"] == "error" for r in run["results"])
+    uri = run["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+    assert uri == str(charter)
+
+
+def test_cli_verify_sarif_clean_and_unenforceable(tmp_path):
+    """Clean charter → zero results, exit 0; agent-only gate → 'unenforceable' warning, exit 0."""
+    charter = _charter(tmp_path, _HUMAN_GATED)
+    ok_settings = _settings(tmp_path, branch="main", required_reviews=1,
+                            require_code_owner_review=True, code_owners=["alice"])
+    clean = runner.invoke(app, ["verify", str(charter), "--settings", str(ok_settings),
+                                "--format", "sarif"])
+    assert clean.exit_code == 0
+    assert json.loads(clean.stdout)["runs"][0]["results"] == []
+
+    agent_charter = _charter(tmp_path, _AGENT_GATED)
+    unenf = runner.invoke(app, ["verify", str(agent_charter), "--settings", str(ok_settings),
+                                "--format", "sarif"])
+    assert unenf.exit_code == 0  # unenforceable does not flip the exit code
+    res = json.loads(unenf.stdout)["runs"][0]["results"]
+    assert len(res) == 1
+    assert res[0]["ruleId"] == "unenforceable"
+    assert res[0]["level"] == "warning"
+
+
+def test_cli_verify_org_sarif_aggregates_and_names_repos(tmp_path, monkeypatch):
+    """--org --format sarif folds every repo into ONE doc; messages name the repo (#72)."""
+    from agenraci.adapters.github import OrgSweepReport, RepoResult, VerifyFinding, VerifyReport
+
+    drift_rep = VerifyReport(project="t", branch="main", ok=False,
+                             findings=[VerifyFinding("merge", "drift", "no approving review")],
+                             unenforceable=[])
+    clean_rep = VerifyReport(project="t", branch="main", ok=True, findings=[],
+                             unenforceable=[VerifyFinding("merge", "unenforceable", "agent-only gate")])
+    fake = OrgSweepReport(org="o", branch="main", ok=False, results=[
+        RepoResult("o/a", "drift", report=drift_rep),
+        RepoResult("o/b", "clean", report=clean_rep),
+        RepoResult("o/c", "could-not-check", error="403"),
+    ])
+    monkeypatch.setattr("agenraci.cli.sweep_org", lambda c, o, branch="main", limit=1000: fake)
+
+    charter = _charter(tmp_path, _HUMAN_GATED)
+    result = runner.invoke(app, ["verify", str(charter), "--org", "o", "--format", "sarif"])
+    assert result.exit_code == 1  # sweep has drift
+    res = json.loads(result.stdout)["runs"][0]["results"]
+    assert len(res) == 2  # 1 drift + 1 unenforceable; could-not-check carries no report
+    texts = [r["message"]["text"] for r in res]
+    assert any(t.startswith("o/a: ") for t in texts)  # repo named in the message
+    assert any(t.startswith("o/b: ") for t in texts)
+    assert {r["ruleId"] for r in res} == {"drift", "unenforceable"}
+
+
+def test_cli_verify_sarif_bad_format_still_rejected(tmp_path):
+    charter = _charter(tmp_path, _HUMAN_GATED)
+    settings = _settings(tmp_path, code_owners=["alice"], required_reviews=1)
+    result = runner.invoke(app, ["verify", str(charter), "--settings", str(settings),
+                                 "--format", "xml"])
+    assert result.exit_code == 2
+    assert "sarif" in result.stdout  # the error message lists the new option
